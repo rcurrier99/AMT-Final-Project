@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 class VA_CNN(nn.Module):
     def __init__(self, channels=8, blocks=2, layers=9, dilation_growth=2, kernel_size=3):
         super(VA_CNN, self).__init__()
+        self.best_val_loss = 1000
         self.channels = channels
         self.layers = layers
         self.dilation_growth = dilation_growth
@@ -60,6 +61,9 @@ class VA_CNN(nn.Module):
                 ep_loss += loss
             print(f"Epoch {n+1} Loss: {loss}")
             output, val_loss = self.process_samples(val_in, val_tar, loss_fn)
+            if val_loss <= self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_model("VA_CNN.pth")
             print(f"Validation Loss: {val_loss}")
     
     def process_samples(self, data_in, data_out, loss_fn):
@@ -68,8 +72,8 @@ class VA_CNN(nn.Module):
             loss = loss_fn(output, data_out)
         return output, loss
 
-    def save_model(self, file_name, dir=''):
-        pass
+    def save_model(self, path):
+        torch.save(self.state_dict(), path)
 
 class VA_CNN_Block(nn.Module):
     def __init__(self, chan_input, chan_output, dilation_growth, kernel_size, layers):
@@ -237,11 +241,18 @@ optimizer = optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
 model.train(train_input, train_target, val_input, val_target, 
              NUM_EPOCHS, loss_fn, optimizer, 40)
 
+# Run Model with Best Validation Accuracy on Test Data
+model.load_state_dict(torch.load("VA_CNN.pth"))
 output, loss = model.process_samples(test_input, test_target, loss_fn)
 output = output.reshape((1, output.shape[0]*output.shape[1]))
 print(output.shape)
 print(f"Test Loss: {loss}")
-#torchaudio.save("./VOX_CNN_output.wav", output, sample_rate, bits_per_sample=16)
+torchaudio.save("./VOX_CNN_output.wav", output, sample_rate, bits_per_sample=16)
 print(torchaudio.info("./VOX_CNN_output.wav"))
 
 finish_time = time.time()
+
+############################################################################################
+# TO DO:
+#
+# Make it like the RNN script with PyTorch Lightning
