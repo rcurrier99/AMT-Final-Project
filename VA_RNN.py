@@ -23,21 +23,27 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class VA_RNN(pl.LightningModule):
-    def __init__(self, input_size=1, output_size=1, hidden_size=32):
+    def __init__(self, input_size=2, output_size=1, hidden_size=32):
         super(VA_RNN, self).__init__()
         self.best_val_loss = 1000
         self.input_size = input_size
         self.output_size = output_size
+        self.best_val_loss = 1000000
         self.rec= nn.LSTM(input_size, hidden_size)
         self.lin = nn.Linear(hidden_size, output_size)
         self.loss_fn = CustomLoss()
 
     def forward(self, x, p):
-        x = x.permute(2, 0, 1)          # --> (seq, batch, channel)
-        # Put parameter control here
+        x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
+        p = p.reshape(p.shape[1], p.shape[0], 1)    # ...
+        s = x.shape[0]                              # num samples
+        c = p.shape[0]                              # num parameters
+        r = int(s/c)                                # num repeats
+        p = p.repeat(r, 1, 1)                       # match time series shape
+        x = torch.cat((x, p), dim=-1)               # append on channel dim
         out, _ = self.rec(x)
         out = torch.tanh(self.lin(out))
-        return out.permute(1, 2, 0)     # --> (batch, channel, seq)
+        return out.permute(1, 2, 0)                 # --> (batch, channel, seq)
 
     @torch.jit.unused
     def training_step(self, batch, batch_idx):
@@ -52,8 +58,13 @@ class VA_RNN(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         input, target, params = batch
         pred = self(input, params)
+
         loss = self.loss_fn(pred, target)
+        if loss <= self.best_val_loss:
+            self.save_model("VA_RNN.pth")
+            self.best_val_loss = loss
         self.log("val_loss", loss)
+
         outputs = {
             "input" : input.cpu().numpy(),
             "target" : target.cpu().numpy(),
@@ -180,7 +191,7 @@ if train_sample_rate != val_sample_rate:
 sample_rate = train_sample_rate
 
 # Train Model
-vox_trainer = pl.Trainer(max_epochs=60, log_every_n_steps=1)
+vox_trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1)
 vox_model = VA_RNN()
 #torchsummary.summary(vox_model)
 vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
@@ -192,13 +203,16 @@ loss_fn = CustomLoss()
 
 for batch_idx, batch in enumerate(vox_test_dataloader):
     input, target, params = batch
-    #print(input.shape)
-    #print(target.shape)
-    #print(params.shape)
+    print(input.shape)
+    print(target.shape)
+    print(params.shape)
     with torch.no_grad():
         output = vox_model(input, params)
-        #print(output.shape)
+        print(output.shape)
 
+    audio = output.reshape((1, output.shape[2]))
+    torchaudio.save(f"./Data/Output_Files/VOX_RNN_{batch_idx+1}.wav", 
+                        audio, sample_rate, bits_per_sample=16)
     loss = loss_fn(output, target)
     print(f"Batch: {batch_idx + 1} Test Loss: {loss}")
 

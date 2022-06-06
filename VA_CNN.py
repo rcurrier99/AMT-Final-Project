@@ -8,21 +8,28 @@
 
 import torch
 import torchaudio
+import torchsummary
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import pytorch_lightning as pl
+from torch.utils.data import Dataset, DataLoader
 
 import os
 import random
 import time
 import math
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
-class VA_CNN(nn.Module):
-    def __init__(self, channels=8, blocks=2, layers=9, dilation_growth=2, kernel_size=3):
+class VA_CNN(pl.LightningModule):
+    def __init__(self, nparams, channels=8, blocks=2, 
+                layers=9, dilation_growth=2, kernel_size=3):
         super(VA_CNN, self).__init__()
         self.best_val_loss = 1000
+        self.loss_fn = CustomLoss()
+        self.nparams = nparams
         self.channels = channels
         self.layers = layers
         self.dilation_growth = dilation_growth
@@ -35,18 +42,64 @@ class VA_CNN(nn.Module):
                                                                 kernel_size,
                                                                 layers))
         self.blocks.append(nn.Conv1d(channels*layers*blocks, 1, 1, 1, 0))
+        
+        # Parameter Embedding
+        self.embed = nn.Sequential(
+                                    nn.Linear(self.nparams, 16),
+                                    nn.ReLU(),
+                                    nn.Linear(16, 32),
+                                    nn.ReLU(),
+                                    nn.Linear(32, 32),
+                                    nn.ReLU())
 
 
-    def forward(self, x):
-        x = x.permute(1, 2, 0)
+    def forward(self, x, p):
+        cond = self.embed(p.float())
+        #x = x.permute(1, 2, 0)
         z = torch.empty([x.shape[0], self.blocks[-1].in_channels, x.shape[2]])
         for n, block in enumerate(self.blocks[:-1]):
-            x, zn = block(x)
+            x, zn = block(x, cond)
             z[:, n*self.channels*self.layers:(n+1)*self.channels*self.layers, :] = zn
-        return self.blocks[-1](z).permute(2, 0, 1)
+        return self.blocks[-1](z) #.permute(2, 0, 1)
 
-    def train(self, data_in, data_tar, val_in, val_tar, 
-                num_epochs, loss_fn, optim, batch_size):
+    @torch.jit.unused 
+    def training_step(self, batch, batch_idx):
+        input, target, params = batch
+        pred = self(input, params)
+        loss = self.loss_fn(pred, target)
+        self.log('train_loss', loss, on_step=True, 
+                    on_epoch=True, prog_bar=True, logger=True)
+        return loss
+
+    @torch.jit.unused
+    def validation_step(self, batch, batch_idx):
+        input, target, params = batch
+        pred = self(input, params)
+
+        loss = self.loss_fn(pred, target)
+        if loss <= self.best_val_loss:
+            self.save_model("VA_CNN.pth")
+            self.best_val_loss = loss
+        self.log("val_loss", loss)
+
+        outputs = {
+            "input" : input.cpu().numpy(),
+            "target" : target.cpu().numpy(),
+            "pred" : pred.cpu().numpy(),
+            "params" : params.cpu().numpy()}
+        return outputs
+
+    @torch.jit.unused
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=0.08)
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
+                                                            patience=10, verbose=True)
+        return {
+            'optimizer' : optimizer,
+            'lr_scheduler' : lr_scheduler,
+            'monitor' : 'val_loss'
+        }
+
         for n in range(num_epochs):
             shuffle = torch.randperm(data_in.shape[1])
             ep_loss = 0
@@ -86,10 +139,10 @@ class VA_CNN_Block(nn.Module):
             self.layers.append(VA_CNN_Layer(chan_input, chan_output, dil, kernel_size))
             chan_input = chan_output
 
-    def forward(self, x):
+    def forward(self, x, p):
         z = torch.empty([x.shape[0], len(self.layers)*self.channels, x.shape[2]])
         for n, layer in enumerate(self.layers):
-            x, zn = layer(x)
+            x, zn = layer(x, p)
             z[:, n*self.channels:(n+1)*self.channels, :] = zn
         return x, z 
 
@@ -108,12 +161,16 @@ class VA_CNN_Layer(nn.Module):
                             kernel_size=1,
                             stride=1,
                             padding=0)
+        self.lin = nn.Linear(32, chan_output * 2)
 
-    def forward(self, x):
+    def forward(self, x, p):
         residual = x
         y = self.conv(x)
-        z = torch.tanh(y[:, 0:self.channels, :]) \
-            * torch.sigmoid(y[:, self.channels:, :])
+        p = self.lin(p)
+        p = p.reshape((p.shape[0], p.shape[1], 1))
+        p = p.expand(-1, -1, y.shape[2])
+        z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
+            * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
         z = torch.cat((torch.zeros(residual.shape[0],
                                     self.channels,
                                     residual.shape[2] - z.shape[2]), z), dim=2)
@@ -152,105 +209,91 @@ class CustomLoss(nn.Module):
         dcloss = self.DCLOSS(output, target)
         return 0.75 * esrloss + 0.25 * dcloss
 
-class DataLoader():
-    def __init__(self):
-        self.sample_rate = None
-        self.in_data = dict.fromkeys(["train", "val", "test"])
-        self.out_data = dict.fromkeys(["train", "val", "test"])
-        self.samples_dict = dict.fromkeys(["train", "val", "test"])
+class VAMLDataSet(Dataset):
+    def __init__(self, device, subset, input_dir, target_dir, annotations):
 
-    def load(self, in_train, in_val, in_test, out_train, out_val, out_test):
-        train_in, self.sample_rate = torchaudio.load(in_train)
-        train_out, self.sample_rate = torchaudio.load(out_train)
-        self.in_data["train"], self.out_data["train"], self.samples_dict["train"] = self._align(train_in, train_out)
-        val_in, self.sample_rate = torchaudio.load(in_val)
-        val_out, self.sample_rate = torchaudio.load(out_val)
-        self.in_data["val"], self.out_data["val"], self.samples_dict["val"]  = self._align(val_in, val_out)
-        test_in, self.sample_rate = torchaudio.load(in_test)
-        test_out, self.sample_rate = torchaudio.load(out_test)
-        self.in_data["test"], self.out_data["test"], self.samples_dict["test"]  = self._align(test_in, test_out)
-        return self.in_data, self.out_data, self.samples_dict
+        self.input_dir = input_dir
+        self.target_dir = target_dir
+        df = pd.read_csv(annotations)
+        self.subset = subset
+        self.annotations = df[(df['device'] == device) & (df['subset'] == subset) ]
+
+        self.sample_rate = 44100
+        self.num_samples = int(self.sample_rate * 1.5)
+
+    def __len__(self):
+        return len(self.annotations)
+    
+    def __getitem__(self, index):
+        input_path = self._get_input_path(index)
+        target_path = self._get_target_path(index)
+        params = torch.tensor(self.annotations.iloc[index, 4:9])
+        input, sr1 = torchaudio.load(input_path)
+        target, sr2 = torchaudio.load(target_path)
+
+        if sr1 != sr2:
+            raise ValueError(f"Input and target files at index {index} have different sample rates")
+        if self.sample_rate != None and self.sample_rate != sr1:
+            raise ValueError(f"Files at index {index} have a different sample rate from the rest of the data")
+
+        return input, target, params
+
+    def _get_input_path(self, index):
+        batch = self.annotations.iloc[index, 3]
+        file = "VAML_" + self.subset + "_" + str(batch) + ".wav"
+        return os.path.join(self.input_dir, file)
+
+    def _get_target_path(self, index):
+        file = self.annotations.iloc[index, 0]
+        return os.path.join(self.target_dir, file)
 
     def _align(self, tensor_1, tensor_2):
-        if tensor_1.shape[1] > tensor_2.shape[1]:
-            tensor_1 = tensor_1[:, :tensor_2.shape[1]]
-            num_samples = tensor_2.shape[1]
-        elif tensor_1.shape[1] < tensor_2.shape[1]:
-            tensor_2 = tensor_2[:, :tensor_1.shape[1]]
-            num_samples = tensor_1.shape[1]
-        return tensor_1, tensor_2, num_samples
+        tensor_1 = tensor_1[:, :self.num_samples]
+        tensor_2 = tensor_2[:, :self.num_samples]
+        return tensor_1, tensor_2
 
 # Load Data
-loader = DataLoader()
+input_dir = "./Data/Input_Files"
+target_dir = "./Data/Target_Files"
+annotations = "./Data/VAML_Annotation.csv"
 
-in_train_path = "./training_data.wav"
-out_train_path = "./VOX_training_data.wav"
-in_val_path = "./validation_data.wav"
-out_val_path = "./VOX_validation_data.wav"
-in_test_path = "./testing_data.wav"
-out_test_path = "./VOX_testing_data.wav"
+vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
+vox_train_dataloader = DataLoader(vox_train_dataset, shuffle = True, batch_size=32)
 
-in_dict, out_dict, num_samples_dict = loader.load(in_train_path, in_val_path, 
-                                                    in_test_path, out_train_path,
-                                                    out_val_path, out_test_path)
-sample_rate = loader.sample_rate
+vox_val_dataset = VAMLDataSet("Vox", "Validation", input_dir, target_dir, annotations)
+vox_val_dataloader = DataLoader(vox_val_dataset, shuffle = True, batch_size=8)
 
-frame_len = math.floor(sample_rate / 2)
-num_samples_train = num_samples_dict["train"]
-num_samples_val = num_samples_dict["val"]
-num_samples_test = num_samples_dict["test"]
-num_frames_train = math.floor(num_samples_train / frame_len)
-num_frames_val = math.floor(num_samples_val / frame_len)
-num_frames_test = math.floor(num_samples_test / frame_len)
+train_sample_rate = vox_train_dataset.sample_rate
+val_sample_rate = vox_val_dataset.sample_rate
+if train_sample_rate != val_sample_rate:
+    ValueError("training and validation data have different sample rates")
+sample_rate = train_sample_rate
 
-train_input = torch.empty((frame_len, num_frames_train, 1))
-train_target = torch.empty((frame_len, num_frames_train, 1))
-val_input = torch.empty((frame_len, num_frames_val, 1))
-val_target = torch.empty((frame_len, num_frames_val, 1))
-test_input = torch.empty((frame_len, num_frames_test, 1))
-test_target = torch.empty((frame_len, num_frames_test, 1))
+# Train Model
+vox_trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1)
+vox_model = VA_CNN(nparams=5)
+#torchsummary.summary(vox_model)
+vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
 
-for i in range(num_frames_train):
-    train_input[:, i, :] = in_dict["train"].reshape((num_samples_train, 1))[i*frame_len:(i+1)*frame_len, :]
-    train_target[:, i, :] = out_dict["train"].reshape((num_samples_train, 1))[i*frame_len:(i+1)*frame_len, :]
-
-for i in range(num_frames_val):
-    val_input[:, i, :] = in_dict["val"].reshape((num_samples_val, 1))[i*frame_len:(i+1)*frame_len, :]
-    val_target[:, i, :] = out_dict["val"].reshape((num_samples_val, 1))[i*frame_len:(i+1)*frame_len, :]
-
-for i in range(num_frames_test):
-    test_input[:, i, :] = in_dict["test"].reshape((num_samples_test, 1))[i*frame_len:(i+1)*frame_len, :]
-    test_target[:, i, :] = out_dict["test"].reshape((num_samples_test, 1))[i*frame_len:(i+1)*frame_len, :]
-
-print(train_input.shape)
-print(train_target.shape)
-print(val_input.shape)
-print(val_target.shape)
-print(test_input.shape)
-print(test_target.shape)
-
-# Training
-
-start_time = time.time()
-
-NUM_EPOCHS = 2
-model = VA_CNN() 
+# Test Model
+vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations)
+vox_test_dataloader = DataLoader(vox_test_dataset, shuffle = True, batch_size=1)
 loss_fn = CustomLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
 
-model.train(train_input, train_target, val_input, val_target, 
-             NUM_EPOCHS, loss_fn, optimizer, 40)
+for batch_idx, batch in enumerate(vox_test_dataloader):
+    input, target, params = batch
+    print(input.shape)
+    print(target.shape)
+    print(params.shape)
+    with torch.no_grad():
+        output = vox_model(input, params)
+        print(output.shape)
 
-# Run Model with Best Validation Accuracy on Test Data
-model.load_state_dict(torch.load("VA_CNN.pth"))
-output, loss = model.process_samples(test_input, test_target, loss_fn)
-output = output.reshape((1, output.shape[0]*output.shape[1]))
-print(output.shape)
-print(f"Test Loss: {loss}")
-torchaudio.save("./VOX_CNN_output.wav", output, sample_rate, bits_per_sample=16)
-print(torchaudio.info("./VOX_CNN_output.wav"))
-
-finish_time = time.time()
+    audio = output.reshape((1, output.shape[2]))
+    torchaudio.save(f"./Data/Output_Files/VOX_CNN_{batch_idx+1}.wav", 
+                        audio, sample_rate, bits_per_sample=16)
+    loss = loss_fn(output, target)
+    print(f"Batch: {batch_idx + 1} Test Loss: {loss}")
 
 ############################################################################################
 # TO DO:
