@@ -2,7 +2,7 @@
 #
 # Ry Currier
 # 2022-05-18
-# RNN Traing Script
+# RNN for Virtual Analog Modeling Traing Script
 #
 ############################################################################################
 
@@ -191,7 +191,7 @@ if train_sample_rate != val_sample_rate:
 sample_rate = train_sample_rate
 
 # Train Model
-vox_trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1)
+vox_trainer = pl.Trainer(max_epochs=60, log_every_n_steps=1)
 vox_model = VA_RNN()
 #torchsummary.summary(vox_model)
 vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)

@@ -2,7 +2,7 @@
 #
 # Ry Currier
 # 2022-05-18
-# CNN Traing Script
+# CNN for Virtual Analog Modeling Traing Script
 #
 ############################################################################################
 
@@ -99,25 +99,6 @@ class VA_CNN(pl.LightningModule):
             'lr_scheduler' : lr_scheduler,
             'monitor' : 'val_loss'
         }
-
-        for n in range(num_epochs):
-            shuffle = torch.randperm(data_in.shape[1])
-            ep_loss = 0
-            for batch in range(math.ceil(shuffle.shape[0] / batch_size)):
-                self.zero_grad()
-                batch_in = data_in[:, shuffle[batch*batch_size:(batch+1)*batch_size], :]
-                batch_tar = data_tar[:, shuffle[batch*batch_size:(batch+1)*batch_size], :]
-                output = self(batch_in)
-                loss = loss_fn(output, batch_tar)
-                loss.backward()
-                optim.step()
-                ep_loss += loss
-            print(f"Epoch {n+1} Loss: {loss}")
-            output, val_loss = self.process_samples(val_in, val_tar, loss_fn)
-            if val_loss <= self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_model("VA_CNN.pth")
-            print(f"Validation Loss: {val_loss}")
     
     def process_samples(self, data_in, data_out, loss_fn):
         with torch.no_grad():
@@ -198,11 +179,51 @@ class DCLoss(nn.Module):
         loss.div_(energy)
         return loss
 
+class MAELoss(nn.Module):
+    def __init__(self):
+        super(MAELoss, self).__init__()
+
+    def forward(self, output, target):
+        return (target - output).sum(-1) / target.shape[-1]
+
+class SCLoss(nn.Module):
+    def __init__(self):
+        super(SCLoss, self).__init__()
+
+    def forward(self, output, target):
+        outputhat = torch.abs(torch.stft(output))
+        targethat = torch.abs(torch.stft(target))
+        num = torch.norm(outputhat - targethat, p="fro")
+        denom = torch.norm(outputhat, p="fro")
+        return num / denom
+
+class SMLoss(nn.Module):
+    def __init__(self):
+        super(SMLoss, self).__init__()
+
+    def forward(self, output, target):
+        outputhat = torch.log(torch.abs(torch.stft(output)))
+        targethat = torch.log(torch.abs(torch.stft(target)))
+        N = target.shape[-1]
+        return torch.norm(outputhat - targethat, p=1) / N
+
+class STFTLoss(nn.Module):
+    def __init__(self):
+        super(STFTLoss, self).__init__()
+        self.SCLOSS = SCLoss()
+        self.SMLOSS = SMLoss()
+
+    def forward(self, output, target):
+        scloss = self.SCLOSS(output, target)
+        smloss = self.SMLOSS(output, target)
+        return scloss + smloss
+
 class CustomLoss(nn.Module):
     def __init__(self):
         super(CustomLoss, self).__init__()
         self.ESRLOSS = ESRLoss()
         self.DCLOSS = DCLoss()
+        self.STFTLOSS = STFTLoss()
 
     def forward(self, output, target):
         esrloss = self.ESRLOSS(output, target)
@@ -270,7 +291,7 @@ if train_sample_rate != val_sample_rate:
 sample_rate = train_sample_rate
 
 # Train Model
-vox_trainer = pl.Trainer(max_epochs=2, log_every_n_steps=1)
+vox_trainer = pl.Trainer(max_epochs=60, log_every_n_steps=1)
 vox_model = VA_CNN(nparams=5)
 #torchsummary.summary(vox_model)
 vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
