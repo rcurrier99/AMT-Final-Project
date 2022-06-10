@@ -22,6 +22,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Using device:', device)
+
 class VA_RNN(pl.LightningModule):
     def __init__(self, input_size=2, output_size=1, hidden_size=32):
         super(VA_RNN, self).__init__()
@@ -219,6 +222,5 @@ for batch_idx, batch in enumerate(vox_test_dataloader):
 ############################################################################################
 # TO DO:
 #
-# Add parameters as network inputs
-# Save iterations with best validation performance
-# Write some audio files
+# Get that ringing to disappear/ improve convergence
+# Implement some frequency domain loss fncns, that might do the trick

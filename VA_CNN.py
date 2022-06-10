@@ -23,6 +23,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Using device:', device)
+
 class VA_CNN(pl.LightningModule):
     def __init__(self, nparams, channels=8, blocks=2, 
                 layers=9, dilation_growth=2, kernel_size=3):
@@ -319,4 +322,6 @@ for batch_idx, batch in enumerate(vox_test_dataloader):
 ############################################################################################
 # TO DO:
 #
-# Make it like the RNN script with PyTorch Lightning
+# Get those clicks at the start of file to disappear/ improve convergence
+# Implement some frequency domain loss fncns, that might do the trick
+# Figure out if the implementation is actually correct
