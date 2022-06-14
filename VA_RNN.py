@@ -22,27 +22,21 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('Using device:', device)
-
 class VA_RNN(pl.LightningModule):
-    def __init__(self, input_size=2, output_size=1, hidden_size=32):
+    def __init__(self, sr, n_params, input_size=1, output_size=1, hidden_size=32):
         super(VA_RNN, self).__init__()
-        self.best_val_loss = 1000
-        self.input_size = input_size
+        self.sample_rate = sr
+        self.input_size = input_size + n_params
         self.output_size = output_size
         self.best_val_loss = 1000000
-        self.rec= nn.LSTM(input_size, hidden_size)
+        self.rec= nn.LSTM(self.input_size, hidden_size)
         self.lin = nn.Linear(hidden_size, output_size)
         self.loss_fn = CustomLoss()
 
     def forward(self, x, p):
         x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
-        p = p.reshape(p.shape[1], p.shape[0], 1)    # ...
-        s = x.shape[0]                              # num samples
-        c = p.shape[0]                              # num parameters
-        r = int(s/c)                                # num repeats
-        p = p.repeat(r, 1, 1)                       # match time series shape
+        p = p.reshape(1, p.shape[0], p.shape[1])    # ...
+        p = p.expand(x.shape[0], -1, -1)            # expand p along time dim
         x = torch.cat((x, p), dim=-1)               # append on channel dim
         out, _ = self.rec(x)
         out = torch.tanh(self.lin(out))
@@ -54,7 +48,8 @@ class VA_RNN(pl.LightningModule):
         pred = self(input, params)
         loss = self.loss_fn(pred, target)
         self.log('train_loss', loss, on_step=True, 
-                    on_epoch=True, prog_bar=True, logger=True)
+                    on_epoch=True, prog_bar=True, 
+                    logger=True, sync_dist=True)
         return loss
 
     @torch.jit.unused
@@ -66,7 +61,7 @@ class VA_RNN(pl.LightningModule):
         if loss <= self.best_val_loss:
             self.save_model("VA_RNN.pth")
             self.best_val_loss = loss
-        self.log("val_loss", loss)
+        self.log("val_loss", loss, sync_dist=True)
 
         outputs = {
             "input" : input.cpu().numpy(),
@@ -76,8 +71,19 @@ class VA_RNN(pl.LightningModule):
         return outputs
 
     @torch.jit.unused
+    def test_step(self, batch, batch_idx):
+        input, target, params = batch
+        output = self(input, params)
+
+        audio = output.reshape((1, output.shape[2])).cpu()
+        torchaudio.save(f"./Data/Output_Files/VOX_RNN_{batch_idx+1}.wav", 
+                            audio, self.sample_rate, bits_per_sample=16)
+        loss = self.loss_fn(output, target)
+        self.log("test_loss", loss, sync_dist=True)
+
+    @torch.jit.unused
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0.08)
+        optimizer = optim.Adam(self.parameters(), lr=0.0008)
         lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
                                                             patience=10, verbose=True)
         return {
@@ -176,48 +182,54 @@ class VAMLDataSet(Dataset):
         tensor_2 = tensor_2[:, :self.num_samples]
         return tensor_1, tensor_2
 
-# Load Data
-input_dir = "./Data/Input_Files"
-target_dir = "./Data/Target_Files"
-annotations = "./Data/VAML_Annotation.csv"
+if __name__ == '__main__':
 
-vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
-vox_train_dataloader = DataLoader(vox_train_dataset, shuffle = True, batch_size=32)
+    WKRS = 0
+    DEV = False
+    GPUS = 1
+    EPOCHS = 150
 
-vox_val_dataset = VAMLDataSet("Vox", "Validation", input_dir, target_dir, annotations)
-vox_val_dataloader = DataLoader(vox_val_dataset, shuffle = True, batch_size=8)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Using device:', device)
 
-train_sample_rate = vox_train_dataset.sample_rate
-val_sample_rate = vox_val_dataset.sample_rate
-if train_sample_rate != val_sample_rate:
-    ValueError("training and validation data have different sample rates")
-sample_rate = train_sample_rate
+    # Load Data
+    input_dir = "./Data/Input_Files"
+    target_dir = "./Data/Target_Files"
+    annotations = "./Data/VAML_Annotation.csv"
 
-# Train Model
-vox_trainer = pl.Trainer(max_epochs=60, log_every_n_steps=1)
-vox_model = VA_RNN()
-#torchsummary.summary(vox_model)
-vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+    vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
+    vox_train_dataloader = DataLoader(vox_train_dataset,
+                                        num_workers=WKRS,
+                                        shuffle = True, 
+                                        batch_size=32)
 
-# Test Model
-vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations)
-vox_test_dataloader = DataLoader(vox_test_dataset, shuffle = True, batch_size=1)
-loss_fn = CustomLoss()
+    vox_val_dataset = VAMLDataSet("Vox", "Validation", input_dir, target_dir, annotations)
+    vox_val_dataloader = DataLoader(vox_val_dataset, 
+                                        num_workers=WKRS,
+                                        shuffle = False, 
+                                        batch_size=8)
 
-for batch_idx, batch in enumerate(vox_test_dataloader):
-    input, target, params = batch
-    print(input.shape)
-    print(target.shape)
-    print(params.shape)
-    with torch.no_grad():
-        output = vox_model(input, params)
-        print(output.shape)
+    train_sample_rate = vox_train_dataset.sample_rate
+    val_sample_rate = vox_val_dataset.sample_rate
+    if train_sample_rate != val_sample_rate:
+        ValueError("training and validation data have different sample rates")
+    sample_rate = train_sample_rate
 
-    audio = output.reshape((1, output.shape[2]))
-    torchaudio.save(f"./Data/Output_Files/VOX_RNN_{batch_idx+1}.wav", 
-                        audio, sample_rate, bits_per_sample=16)
-    loss = loss_fn(output, target)
-    print(f"Batch: {batch_idx + 1} Test Loss: {loss}")
+    # Train Model
+    vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
+                                log_every_n_steps=1, fast_dev_run=DEV)
+    vox_model = VA_RNN(sr=sample_rate, n_params=5)
+    #torchsummary.summary(vox_model)
+    vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+
+    # Test Model
+    vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations)
+    vox_test_dataloader = DataLoader(vox_test_dataset, 
+                                        num_workers=WKRS,
+                                        shuffle = False, 
+                                        batch_size=1)
+    if not DEV:
+        vox_trainer.test(dataloaders=vox_test_dataloader)
 
 ############################################################################################
 # TO DO:
