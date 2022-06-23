@@ -24,13 +24,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class VA_CNN(pl.LightningModule):
-    def __init__(self, nparams, sr, channels=8, blocks=2, 
+    def __init__(self, nparams, sr, device, config, channels=8, blocks=2, 
                 layers=9, dilation_growth=2, kernel_size=3):
         super(VA_CNN, self).__init__()
         self.sample_rate = sr
         self.best_val_loss = 1000
         self.loss_fn = CustomLoss()
         self.nparams = nparams
+        self.unit = device
+        self.config = config
         self.channels = channels
         self.layers = layers
         self.dilation_growth = dilation_growth
@@ -96,8 +98,8 @@ class VA_CNN(pl.LightningModule):
         output = self(input, params)
 
         audio = output.reshape((1, output.shape[2])).cpu()
-        torchaudio.save(f"./Data/Output_Files/VOX_CNN_{batch_idx+1}.wav", 
-                            audio, self.sample_rate, bits_per_sample=16)
+        file = f"./Data/Output_Files/{self.unit}_CNN_{self.config}_{batch_idx+1}.wav"
+        torchaudio.save(file, audio, self.sample_rate, bits_per_sample=16)
         loss = self.loss_fn(output, target)
         self.log("test_loss", loss, sync_dist=True)
 
@@ -245,13 +247,16 @@ class CustomLoss(nn.Module):
         return 0.75 * esrloss + 0.25 * dcloss
 
 class VAMLDataSet(Dataset):
-    def __init__(self, device, subset, input_dir, target_dir, annotations):
+    def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
 
         self.input_dir = input_dir
         self.target_dir = target_dir
         df = pd.read_csv(annotations)
         self.subset = subset
-        self.annotations = df[(df['device'] == device) & (df['subset'] == subset) ]
+        if config == None:
+            self.annotations = df[(df['device'] == device) & (df['subset'] == subset)]
+        else:
+            self.annotations = df[(df['device'] == device) & (df['subset'] == subset) & (df['config'] == config)]
 
         self.sample_rate = 44100
         self.num_samples = int(self.sample_rate * 1.5)
@@ -293,51 +298,57 @@ if __name__ == '__main__':
     DEV = False
     GPUS = 1
     EPOCHS = 100
+    DEVICE = "Vox"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
+
+    pl.seed_everything(42)
 
     # Load Data
     input_dir = "./Data/Input_Files"
     target_dir = "./Data/Target_Files"
     annotations = "./Data/VAML_Annotation.csv"
 
-    vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
-    vox_train_dataloader = DataLoader(vox_train_dataset, 
-                                        num_workers=WKRS,
-                                        shuffle = True, 
-                                        batch_size=32)
+    for i in range(4):
 
-    vox_val_dataset = VAMLDataSet("Vox", "Validation", input_dir, target_dir, annotations)
-    vox_val_dataloader = DataLoader(vox_val_dataset, 
-                                        num_workers = WKRS, 
-                                        shuffle = False, 
-                                        batch_size=8)
+        vox_train_dataset = VAMLDataSet(DEVICE, "Training", input_dir, target_dir, annotations, config=i)
+        vox_train_dataloader = DataLoader(vox_train_dataset, 
+                                            num_workers=WKRS,
+                                            shuffle = True, 
+                                            batch_size=32)
 
-    train_sample_rate = vox_train_dataset.sample_rate
-    val_sample_rate = vox_val_dataset.sample_rate
-    if train_sample_rate != val_sample_rate:
-        ValueError("training and validation data have different sample rates")
-    sample_rate = train_sample_rate
+        vox_val_dataset = VAMLDataSet(DEVICE, "Validation", input_dir, target_dir, annotations, config=i)
+        vox_val_dataloader = DataLoader(vox_val_dataset, 
+                                            num_workers = WKRS, 
+                                            shuffle = False, 
+                                            batch_size=8)
 
-    # Train Model
-    vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
-                                log_every_n_steps=1, fast_dev_run=DEV)
-    vox_model = VA_CNN(nparams=5, sr=sample_rate)
-    #torchsummary.summary(vox_model)
-    vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+        train_sample_rate = vox_train_dataset.sample_rate
+        val_sample_rate = vox_val_dataset.sample_rate
+        if train_sample_rate != val_sample_rate:
+            ValueError("training and validation data have different sample rates")
+        sample_rate = train_sample_rate
 
-    # Test Model
-    vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations)
-    vox_test_dataloader = DataLoader(vox_test_dataset, 
-                                        num_workers=WKRS, 
-                                        shuffle = False, 
-                                        batch_size=1)
-    if not DEV:
-        vox_trainer.test(dataloaders=vox_test_dataloader)
+        # Train Model
+        vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
+                                    log_every_n_steps=1, fast_dev_run=DEV)
+        vox_model = VA_CNN(nparams=5, sr=sample_rate, device=DEVICE, config=i)
+        #torchsummary.summary(vox_model)
+        vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+
+        # Test Model
+        vox_test_dataset = VAMLDataSet(DEVICE, "Testing", input_dir, target_dir, annotations, config=i)
+        vox_test_dataloader = DataLoader(vox_test_dataset, 
+                                            num_workers=WKRS, 
+                                            shuffle = False, 
+                                            batch_size=1)
+        if not DEV:
+            vox_trainer.test(dataloaders=vox_test_dataloader)
 
 ############################################################################################
 # TO DO:
 #
-# Get those clicks at the start of file to disappear/ improve convergence
-# Implement some frequency domain loss fncns, that might do the trick
+# Allow for modeling individual parameter settings
+# Factor in phase shift as gain increases
+# Improve frequency domain loss fncns

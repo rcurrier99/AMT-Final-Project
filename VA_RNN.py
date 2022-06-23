@@ -23,11 +23,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class VA_RNN(pl.LightningModule):
-    def __init__(self, sr, n_params, input_size=1, output_size=1, hidden_size=32):
+    def __init__(self, sr, n_params, device, config, 
+                    input_size=1, output_size=1, hidden_size=32):
         super(VA_RNN, self).__init__()
         self.sample_rate = sr
         self.input_size = input_size + n_params
         self.output_size = output_size
+        self.unit = device
+        self.config = config
         self.best_val_loss = 1000000
         self.rec= nn.LSTM(self.input_size, hidden_size)
         self.lin = nn.Linear(hidden_size, output_size)
@@ -35,11 +38,12 @@ class VA_RNN(pl.LightningModule):
 
     def forward(self, x, p):
         x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
+        res = x.type_as(x)
         p = p.reshape(1, p.shape[0], p.shape[1])    # ...
         p = p.expand(x.shape[0], -1, -1)            # expand p along time dim
         x = torch.cat((x, p), dim=-1)               # append on channel dim
         out, _ = self.rec(x)
-        out = torch.tanh(self.lin(out))
+        out = torch.tanh(self.lin(out)) #+ res
         return out.permute(1, 2, 0)                 # --> (batch, channel, seq)
 
     @torch.jit.unused
@@ -76,8 +80,8 @@ class VA_RNN(pl.LightningModule):
         output = self(input, params)
 
         audio = output.reshape((1, output.shape[2])).cpu()
-        torchaudio.save(f"./Data/Output_Files/VOX_RNN_{batch_idx+1}.wav", 
-                            audio, self.sample_rate, bits_per_sample=16)
+        file = f"./Data/Output_Files/{self.unit}_RNN_{self.config}_{batch_idx+1}.wav"
+        torchaudio.save(file, audio, self.sample_rate, bits_per_sample=16)
         loss = self.loss_fn(output, target)
         self.log("test_loss", loss, sync_dist=True)
 
@@ -128,25 +132,78 @@ class DCLoss(nn.Module):
         loss.div_(energy)
         return loss
 
+class MAELoss(nn.Module):
+    def __init__(self):
+        super(MAELoss, self).__init__()
+
+    def forward(self, output, target):
+        return (target - output).sum(-1) / target.shape[-1]
+
+class SCLoss(nn.Module):
+    def __init__(self):
+        super(SCLoss, self).__init__()
+
+    def forward(self, output, target):
+        outputhat = torch.abs(
+            torch.stft(output.view(-1, output.size(-1)), 1024))
+        targethat = torch.abs(
+            torch.stft(target.view(-1, target.size(-1)), 1024))
+        num = torch.norm(outputhat - targethat, p="fro")
+        denom = torch.norm(outputhat, p="fro") + 1e-5
+        num.div_(denom)
+        return num
+
+class SMLoss(nn.Module):
+    def __init__(self):
+        super(SMLoss, self).__init__()
+
+    def forward(self, output, target):
+        outputhat = torch.log(
+            torch.abs(
+                torch.stft(
+                    output.view(-1, output.size(-1)), 1024)) + 1e-5)
+        targethat = torch.log(
+            torch.abs(
+                torch.stft(
+                    target.view(-1, target.size(-1)), 1024)) + 1e-5)
+        N = target.shape[-1]
+        return torch.norm(outputhat - targethat, p=1) / N
+
+class STFTLoss(nn.Module):
+    def __init__(self):
+        super(STFTLoss, self).__init__()
+        self.SCLOSS = SCLoss()
+        self.SMLOSS = SMLoss()
+
+    def forward(self, output, target):
+        scloss = self.SCLOSS(output, target)
+        smloss = self.SMLOSS(output, target)
+        return (scloss + smloss) / 2
+
 class CustomLoss(nn.Module):
     def __init__(self):
         super(CustomLoss, self).__init__()
         self.ESRLOSS = ESRLoss()
         self.DCLOSS = DCLoss()
+        self.STFTLOSS = STFTLoss()
 
     def forward(self, output, target):
         esrloss = self.ESRLOSS(output, target)
         dcloss = self.DCLOSS(output, target)
-        return 0.75 * esrloss + 0.25 * dcloss
+        #stftloss = self.STFTLOSS(output, target)
+        return 1 * (0.75 * esrloss + 0.25 * dcloss)
 
 class VAMLDataSet(Dataset):
-    def __init__(self, device, subset, input_dir, target_dir, annotations):
+    def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
 
         self.input_dir = input_dir
         self.target_dir = target_dir
         df = pd.read_csv(annotations)
         self.subset = subset
-        self.annotations = df[(df['device'] == device) & (df['subset'] == subset) ]
+        if config == None:
+            self.annotations = df[(df['device'] == device) & (df['subset'] == subset)]
+        else:
+            self.annotations = df[(df['device'] == device) & (df['subset'] == subset) & (df['config'] == config)]
 
         self.sample_rate = 44100
         self.num_samples = int(self.sample_rate * 1.5)
@@ -188,51 +245,57 @@ if __name__ == '__main__':
     DEV = False
     GPUS = 1
     EPOCHS = 150
+    DEVICE = "Vox"
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
+
+    pl.seed_everything(42)
 
     # Load Data
     input_dir = "./Data/Input_Files"
     target_dir = "./Data/Target_Files"
     annotations = "./Data/VAML_Annotation.csv"
 
-    vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
-    vox_train_dataloader = DataLoader(vox_train_dataset,
-                                        num_workers=WKRS,
-                                        shuffle = True, 
-                                        batch_size=32)
+    for i in range(4):
 
-    vox_val_dataset = VAMLDataSet("Vox", "Validation", input_dir, target_dir, annotations)
-    vox_val_dataloader = DataLoader(vox_val_dataset, 
-                                        num_workers=WKRS,
-                                        shuffle = False, 
-                                        batch_size=8)
+        vox_train_dataset = VAMLDataSet(DEVICE, "Training", input_dir, target_dir, annotations, config=i)
+        vox_train_dataloader = DataLoader(vox_train_dataset,
+                                            num_workers=WKRS,
+                                            shuffle = True, 
+                                            batch_size=32)
 
-    train_sample_rate = vox_train_dataset.sample_rate
-    val_sample_rate = vox_val_dataset.sample_rate
-    if train_sample_rate != val_sample_rate:
-        ValueError("training and validation data have different sample rates")
-    sample_rate = train_sample_rate
+        vox_val_dataset = VAMLDataSet(DEVICE, "Validation", input_dir, target_dir, annotations, config=i)
+        vox_val_dataloader = DataLoader(vox_val_dataset, 
+                                            num_workers=WKRS,
+                                            shuffle = False, 
+                                            batch_size=8)
 
-    # Train Model
-    vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
-                                log_every_n_steps=1, fast_dev_run=DEV)
-    vox_model = VA_RNN(sr=sample_rate, n_params=5)
-    #torchsummary.summary(vox_model)
-    vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+        train_sample_rate = vox_train_dataset.sample_rate
+        val_sample_rate = vox_val_dataset.sample_rate
+        if train_sample_rate != val_sample_rate:
+            ValueError("training and validation data have different sample rates")
+        sample_rate = train_sample_rate
 
-    # Test Model
-    vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations)
-    vox_test_dataloader = DataLoader(vox_test_dataset, 
-                                        num_workers=WKRS,
-                                        shuffle = False, 
-                                        batch_size=1)
-    if not DEV:
-        vox_trainer.test(dataloaders=vox_test_dataloader)
+        # Train Model
+        vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
+                                    log_every_n_steps=1, fast_dev_run=DEV)
+        vox_model = VA_RNN(sr=sample_rate, n_params=5, device=DEVICE, config=i)
+        #torchsummary.summary(vox_model)
+        vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+
+        # Test Model
+        vox_test_dataset = VAMLDataSet(DEVICE, "Testing", input_dir, target_dir, annotations, config=i)
+        vox_test_dataloader = DataLoader(vox_test_dataset, 
+                                            num_workers=WKRS,
+                                            shuffle = False, 
+                                            batch_size=1)
+        if not DEV:
+            vox_trainer.test(dataloaders=vox_test_dataloader)
 
 ############################################################################################
 # TO DO:
 #
-# Get that ringing to disappear/ improve convergence
-# Implement some frequency domain loss fncns, that might do the trick
+# Allow for modeling individual parameter settings
+# Factor in phase shift as gain increases
+# Improve frequency domain loss fncns

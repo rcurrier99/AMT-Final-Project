@@ -2,13 +2,15 @@ import torch
 import torchaudio
 import torchsummary
 import torch.nn as nn
-import torch.nn.functional as F
+import torchaudio.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
+from VA_CNN import CustomLoss, VAMLDataSet
 
 import os
 import librosa
+import librosa.display
 import pickle
 import numpy as np
 import pandas as pd
@@ -17,60 +19,68 @@ import matplotlib.pyplot as plt
 import pywt
 import ptwt
 
-## Dataset
-
-class VAMLDataSet(Dataset):
-    def __init__(self, device, subset, input_dir, target_dir, annotations):
-
-        self.input_dir = input_dir
-        self.target_dir = target_dir
-        df = pd.read_csv(annotations)
-        self.subset = subset
-        self.annotations = df[(df['device'] == device) & (df['subset'] == subset) ]
-
-        self.sample_rate = 44100
-        self.num_samples = int(self.sample_rate * 1.5)
-
-    def __len__(self):
-        return len(self.annotations)
-    
-    def __getitem__(self, index):
-        input_path = self._get_input_path(index)
-        target_path = self._get_target_path(index)
-        params = torch.tensor(self.annotations.iloc[index, 4:9])
-        input, sr1 = torchaudio.load(input_path)
-        target, sr2 = torchaudio.load(target_path)
-
-        if sr1 != sr2:
-            raise ValueError(f"Input and target files at index {index} have different sample rates")
-        if self.sample_rate != None and self.sample_rate != sr1:
-            raise ValueError(f"Files at index {index} have a different sample rate from the rest of the data")
-
-        return input, target, params
-
-    def _get_input_path(self, index):
-        batch = self.annotations.iloc[index, 3]
-        file = "VAML_" + self.subset + "_" + str(batch) + ".wav"
-        return os.path.join(self.input_dir, file)
-
-    def _get_target_path(self, index):
-        file = self.annotations.iloc[index, 0]
-        return os.path.join(self.target_dir, file)
-
-    def _align(self, tensor_1, tensor_2):
-        tensor_1 = tensor_1[:, :self.num_samples]
-        tensor_2 = tensor_2[:, :self.num_samples]
-        return tensor_1, tensor_2
-
 # Load Data
 input_dir = "./Data/Input_Files"
 target_dir = "./Data/Target_Files"
 annotations = "./Data/VAML_Annotation.csv"
 
-vox_train_dataset = VAMLDataSet("Vox", "Training", input_dir, target_dir, annotations)
+config = 0
+
+vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations, config)
 
 wavelet = pywt.Wavelet('db4')
-data, _, _ = vox_train_dataset.__getitem__(0)
+
+n = 10
+inv = 0                                                         # 1 to invert result
+fac = pow(-1, inv)
+RNN_file = "./Data/Output_Files/Vox_RNN_" + str(config) + "_" + str(n+1) + ".wav"
+CNN_file = "./Data/Output_Files/Vox_CNN_" + str(config) + "_" + str(n+1) + ".wav"
+data, target, params = vox_test_dataset.__getitem__(n)
+RNN_res, _ = torchaudio.load(RNN_file)
+CNN_res, _ = torchaudio.load(CNN_file)
+gain = params[0].numpy()
+loss_fn = CustomLoss()
+rnn_loss = loss_fn(fac * RNN_res, target).numpy()
+cnn_loss = loss_fn(fac * CNN_res, target).numpy()
+
+def spec(tensor):
+    stft = librosa.stft(tensor.numpy(), n_fft=512, hop_length=256)
+    spectrogram = np.abs(stft.reshape(stft.shape[1], stft.shape[2]))
+    log_spectrogram = librosa.amplitude_to_db(spectrogram, ref=np.max)
+    return log_spectrogram
+
+tar_spec = spec(target)
+RNN_res_spec = spec(RNN_res)
+CNN_res_spec = spec(CNN_res)
+
+t = np.linspace(0, 1.5, 66150)
+fig1, axs1 = plt.subplots(3, 1, constrained_layout=True, sharex=True, sharey=True)
+fig1.suptitle("Gain=" + str(gain), fontsize=16)
+axs1[0].plot(t, torch.transpose(data, 0, 1))
+axs1[0].set_title("Input")
+axs1[0].set_xlabel("Time (s)")
+axs1[1].plot(t, fac * torch.transpose(RNN_res, 0, 1), t, torch.transpose(target, 0, 1))
+axs1[1].set_title("RNN Output" + " Loss=" + str(rnn_loss))
+axs1[1].set_xlabel("Time (s)")
+axs1[2].plot(t, fac * torch.transpose(CNN_res, 0, 1), t, torch.transpose(target, 0, 1))
+axs1[2].set_title("CNN Output" + " Loss=" + str(cnn_loss))
+axs1[2].set_xlabel("Time (s)")
+
+fig2, axs2 = plt.subplots(3, 1, constrained_layout=True, sharex=True, sharey=True)
+fig2.suptitle("Gain=" + str(gain), fontsize=16)
+im1 = librosa.display.specshow(tar_spec, x_axis='time', y_axis='log', ax=axs2[0])
+fig2.colorbar(im1, ax=axs2[0], format="%+2.f dB")
+axs2[0].set(title='Target')
+im2 = librosa.display.specshow(RNN_res_spec, x_axis='time', y_axis='log', ax=axs2[1])
+fig2.colorbar(im2, ax=axs2[1], format="%+2.f dB")
+axs2[1].set(title='RNN' + " Loss=" + str(rnn_loss))
+im3 = librosa.display.specshow(tar_spec, x_axis='time', y_axis='log', ax=axs2[2])
+fig2.colorbar(im3, ax=axs2[2], format="%+2.f dB")
+axs2[2].set(title='CNN' + " Loss=" + str(cnn_loss))
+
+
+plt.show()
+
 transform_data = ptwt.wavedec(data, wavelet, mode='zero', level=2)
 
 print(data.shape[1])

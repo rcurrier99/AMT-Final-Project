@@ -29,8 +29,9 @@ class VA_Transformer(pl.LightningModule):
             self,
             sr,
             lr,
+            n_params,
             channels=1,
-            num_heads=8,
+            num_heads=3,
             num_encoder_layers=3,
             num_decoder_layers=3,
             ff_expansion=2,
@@ -52,20 +53,20 @@ class VA_Transformer(pl.LightningModule):
         self.lin = nn.Linear(pow(ff_expansion, num_encoder_layers), output_size)
 
     def forward(self, x, t, p):
-        x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
-        t = t.permute(2, 0, 1)                      # ...
-        p = p.reshape(p.shape[1], p.shape[0], 1)    # ...
+        x = x.permute(1, 0, 2)                      # --> (channel, batch, seq)
+        t = t.permute(1, 0, 2)                      # ...
+        p = p.reshape(1, p.shape[0], p.shape[1])    # ...
         p = p.expand(x.shape[0], -1, -1)            # expand p along time dim
-        x = torch.cat((x, p), dim=-1)               # append on channel dim
+        x = torch.cat((x, p), dim=-1)               # append on seq dim
         t = torch.cat((t, p), dim=-1)               # ...
         out = self.transformer(x, t)
-        out = torch.tanh(self.lin(out))[:, :, 0]
-        return out.permute(1, 2, 0)                 # --> (batch, channel, seq)
+        #out = torch.tanh(self.lin(out))
+        return out.permute(1, 0, 2)[:, :, 0]        # --> (batch, channel, seq)
 
     @torch.jit.unused
     def training_step(self, batch, batch_idx):
         input, target, params = batch
-        pred = self(input, params)
+        pred = self(input, target, params)
         loss = self.loss_fn(pred, target)
         self.log('train_loss', loss, on_step=True, 
                     on_epoch=True, prog_bar=True, 
@@ -75,7 +76,7 @@ class VA_Transformer(pl.LightningModule):
     @torch.jit.unused
     def validation_step(self, batch, batch_idx):
         input, target, params = batch
-        pred = self(input, params)
+        pred = self(input, target, params)
 
         loss = self.loss_fn(pred, target)
         if loss <= self.best_val_loss:
@@ -93,7 +94,7 @@ class VA_Transformer(pl.LightningModule):
     @torch.jit.unused
     def test_step(self, batch, batch_idx):
         input, target, params = batch
-        output = self(input, params)
+        output = self(input, target, params)
 
         audio = output.reshape((1, output.shape[2])).cpu()
         torchaudio.save(f"./Data/Output_Files/VOX_VAE_{batch_idx+1}.wav", 
@@ -224,7 +225,7 @@ if __name__ == '__main__':
     # Train Model
     vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
                                 log_every_n_steps=1, fast_dev_run=DEV)
-    vox_model = VA_Transformer(sr=sample_rate, lr=LEARNING_RATE)
+    vox_model = VA_Transformer(sr=sample_rate, lr=LEARNING_RATE, n_params=5)
     #torchsummary.summary(vox_model)
     vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
 
