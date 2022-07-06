@@ -68,6 +68,8 @@ class VA_CNN(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         input, target, params = batch
         pred = self(input, params)
+
+        pred, target = self.pre_emph(pred, target)
         loss = self.loss_fn(pred, target)
         self.log('train_loss', loss, on_step=True, 
                     on_epoch=True, prog_bar=True, 
@@ -79,6 +81,7 @@ class VA_CNN(pl.LightningModule):
         input, target, params = batch
         pred = self(input, params)
 
+        pred, target = self.pre_emph(pred, target)
         loss = self.loss_fn(pred, target)
         if loss <= self.best_val_loss:
             self.save_model("VA_CNN.pth")
@@ -100,12 +103,14 @@ class VA_CNN(pl.LightningModule):
         audio = output.reshape((1, output.shape[2])).cpu()
         file = f"./Data/Output_Files/{self.unit}_CNN_{self.config}_{batch_idx+1}.wav"
         torchaudio.save(file, audio, self.sample_rate, bits_per_sample=16)
+
+        output, target = self.pre_emph(output, target)
         loss = self.loss_fn(output, target)
         self.log("test_loss", loss, sync_dist=True)
 
     @torch.jit.unused
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0.0008)
+        optimizer = optim.Adam(self.parameters(), lr=0.005)
         lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
                                                             patience=10, verbose=True)
         return {
@@ -122,6 +127,13 @@ class VA_CNN(pl.LightningModule):
 
     def save_model(self, path):
         torch.save(self.state_dict(), path)
+
+    def pre_emph(self, pred, target):
+        filter = nn.Conv1d(1, 1, 2, padding='same', bias=False)
+        filter.weight.data = torch.tensor([-0.85, 1], requires_grad=False).reshape(1,1,2).type_as(pred)
+        pred = filter(pred).type_as(pred)
+        target = filter(target).type_as(target)
+        return pred, target
 
 class VA_CNN_Block(nn.Module):
     def __init__(self, chan_input, chan_output, dilation_growth, kernel_size, layers):
@@ -164,8 +176,8 @@ class VA_CNN_Layer(nn.Module):
         p = self.lin(p.float())
         p = p.reshape((p.shape[0], p.shape[1], 1))
         p = p.expand(-1, -1, y.shape[2])
-        z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
-            * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
+        z = torch.tanh(y[:, 0:self.channels, :] + 0*p[:, 0:self.channels, :]) \
+            * torch.sigmoid(y[:, self.channels:, :] + 0*p[:, self.channels:, :])
         z = torch.cat(
             (torch.zeros(residual.shape[0],
                             self.channels,
@@ -297,54 +309,56 @@ if __name__ == '__main__':
     WKRS = 0
     DEV = False
     GPUS = 1
-    EPOCHS = 100
-    DEVICE = "Vox"
+    EPOCHS = 500
+    DEVICE = "Comp"
+    CONFIG = 4
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
-
-    pl.seed_everything(42)
 
     # Load Data
     input_dir = "./Data/Input_Files"
     target_dir = "./Data/Target_Files"
     annotations = "./Data/VAML_Annotation.csv"
 
-    for i in range(4):
+    pl.seed_everything(42)
 
-        vox_train_dataset = VAMLDataSet(DEVICE, "Training", input_dir, target_dir, annotations, config=i)
-        vox_train_dataloader = DataLoader(vox_train_dataset, 
-                                            num_workers=WKRS,
-                                            shuffle = True, 
-                                            batch_size=32)
+    vox_train_dataset = VAMLDataSet(DEVICE, "Training", 
+                                        input_dir, target_dir, annotations, config=CONFIG)
+    vox_train_dataloader = DataLoader(vox_train_dataset, 
+                                        num_workers=WKRS,
+                                        shuffle = True, 
+                                        batch_size=32)
 
-        vox_val_dataset = VAMLDataSet(DEVICE, "Validation", input_dir, target_dir, annotations, config=i)
-        vox_val_dataloader = DataLoader(vox_val_dataset, 
-                                            num_workers = WKRS, 
-                                            shuffle = False, 
-                                            batch_size=8)
+    vox_val_dataset = VAMLDataSet(DEVICE, "Validation", 
+                                        input_dir, target_dir, annotations, config=CONFIG)
+    vox_val_dataloader = DataLoader(vox_val_dataset, 
+                                        num_workers = WKRS, 
+                                        shuffle = False, 
+                                        batch_size=8)
 
-        train_sample_rate = vox_train_dataset.sample_rate
-        val_sample_rate = vox_val_dataset.sample_rate
-        if train_sample_rate != val_sample_rate:
-            ValueError("training and validation data have different sample rates")
-        sample_rate = train_sample_rate
+    train_sample_rate = vox_train_dataset.sample_rate
+    val_sample_rate = vox_val_dataset.sample_rate
+    if train_sample_rate != val_sample_rate:
+        ValueError("training and validation data have different sample rates")
+    sample_rate = train_sample_rate
 
-        # Train Model
-        vox_trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
-                                    log_every_n_steps=1, fast_dev_run=DEV)
-        vox_model = VA_CNN(nparams=5, sr=sample_rate, device=DEVICE, config=i)
-        #torchsummary.summary(vox_model)
-        vox_trainer.fit(vox_model, vox_train_dataloader, vox_val_dataloader)
+    # Train Model
+    trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
+                            log_every_n_steps=1, fast_dev_run=DEV)
+    model = VA_CNN(sr=sample_rate, nparams=5, device=DEVICE, config=CONFIG)
+    #torchsummary.summary(vox_model)
+    trainer.fit(model, vox_train_dataloader, vox_val_dataloader)
 
-        # Test Model
-        vox_test_dataset = VAMLDataSet(DEVICE, "Testing", input_dir, target_dir, annotations, config=i)
-        vox_test_dataloader = DataLoader(vox_test_dataset, 
-                                            num_workers=WKRS, 
-                                            shuffle = False, 
-                                            batch_size=1)
-        if not DEV:
-            vox_trainer.test(dataloaders=vox_test_dataloader)
+    # Test Model
+    vox_test_dataset = VAMLDataSet(DEVICE, "Testing", 
+                                        input_dir, target_dir, annotations, config=CONFIG)
+    vox_test_dataloader = DataLoader(vox_test_dataset, 
+                                        num_workers=WKRS, 
+                                        shuffle = False, 
+                                        batch_size=1)
+    if not DEV:
+        trainer.test(dataloaders=vox_test_dataloader)
 
 ############################################################################################
 # TO DO:

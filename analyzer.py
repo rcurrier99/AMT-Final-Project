@@ -30,7 +30,7 @@ target_dir = "./Data/Target_Files"
 annotations = "./Data/VAML_Annotation.csv"
 
 n = 10                  # file number   
-config = 1              # parameter configuration
+config = 4              # parameter configuration
 inv = 0                 # 1 to invert result
 
 vox_test_dataset = VAMLDataSet("Vox", "Testing", input_dir, target_dir, annotations, config)
