@@ -31,27 +31,38 @@ class VA_RNN(pl.LightningModule):
         self.output_size = output_size
         self.unit = device
         self.config = config
+
         self.best_val_loss = 1000000
+
         self.rec= nn.LSTM(self.input_size, hidden_size)
         self.lin = nn.Linear(hidden_size, output_size)
+        self.embed = nn.ConvTranspose1d(1, 8, 1)
+        self.lim = nn.Hardtanh()
         self.loss_fn = CustomLoss()
+        self.enc = nn.Conv1d(1, 8, 3, padding='same')
+        self.dec = nn.ConvTranspose1d(8, 1, 3, padding=1)
 
     def forward(self, x, p):
+        #x = self.enc(x)
+
         x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
+        p = p.permute(2, 0, 1)
         res = x.type_as(x)
-        p = p.reshape(1, p.shape[0], p.shape[1])    # ...
-        p = p.expand(x.shape[0], -1, -1)            # expand p along time dim
-        #x = torch.cat((x, p), dim=-1)               # append on channel dim
+
+        x = torch.cat((x, p), dim=-1)               # append on channel dim
         out, _ = self.rec(x)
-        out = self.lin(out) #+ res
+        out = self.lim(self.lin(out) + res)
         return out.permute(1, 2, 0)                 # --> (batch, channel, seq)
+        
+        #return self.dec(out)
 
     @torch.jit.unused
     def training_step(self, batch, batch_idx):
         input, target, params = batch
-        pred = self(input, params)
 
+        pred = self(input, params)
         pred, target = self.pre_emph(pred, target)
+
         loss = self.loss_fn(pred, target)
         self.log('train_loss', loss, on_step=True, 
                     on_epoch=True, prog_bar=True, 
@@ -92,7 +103,7 @@ class VA_RNN(pl.LightningModule):
 
     @torch.jit.unused
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0.005)
+        optimizer = optim.Adam(self.parameters(), lr=0.0005)
         lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
                                                             patience=10, verbose=True)
         return {
@@ -190,7 +201,7 @@ class STFTLoss(nn.Module):
     def forward(self, output, target):
         scloss = self.SCLOSS(output, target)
         smloss = self.SMLOSS(output, target)
-        return (scloss + smloss) / 2
+        return 0.75*scloss + 0.25*smloss
 
 class CustomLoss(nn.Module):
     def __init__(self):
@@ -202,12 +213,12 @@ class CustomLoss(nn.Module):
     def forward(self, output, target):
         esrloss = self.ESRLOSS(output, target)
         dcloss = self.DCLOSS(output, target)
-        #stftloss = self.STFTLOSS(output, target)
-        return 1 * (0.75 * esrloss + 0.25 * dcloss)
+        stftloss = self.STFTLOSS(output, target)
+        return 0.75 * esrloss + 0.25 * dcloss # + stftloss)/2
 
 class VAMLDataSet(Dataset):
     def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
-
+        self.device = device
         self.input_dir = input_dir
         self.target_dir = target_dir
         df = pd.read_csv(annotations)
@@ -218,15 +229,25 @@ class VAMLDataSet(Dataset):
             self.annotations = df[(df['device'] == device) & (df['subset'] == subset) & (df['config'] == config)]
 
         self.sample_rate = 44100
+        self.tbptt_len = 1225
         self.num_samples = int(self.sample_rate * 1.5)
+        self.num_frames = int(np.floor(self.num_samples / self.tbptt_len))
 
     def __len__(self):
-        return len(self.annotations)
+        if self.subset != "Training":
+            return len(self.annotations)
+        else:
+            return self.num_frames * len(self.annotations)
     
     def __getitem__(self, index):
+        idx = int(np.floor(index / self.num_frames))
+        rem = index - self.num_frames * idx
+
+        index = index if self.subset != "Training" else idx
+
         input_path = self._get_input_path(index)
         target_path = self._get_target_path(index)
-        params = torch.tensor(self.annotations.iloc[index, 4:9])
+
         input, sr1 = torchaudio.load(input_path)
         target, sr2 = torchaudio.load(target_path)
 
@@ -234,6 +255,21 @@ class VAMLDataSet(Dataset):
             raise ValueError(f"Input and target files at index {index} have different sample rates")
         if self.sample_rate != None and self.sample_rate != sr1:
             raise ValueError(f"Files at index {index} have a different sample rate from the rest of the data")
+        
+        if self.device != "Phase":
+            params = torch.tensor(self.annotations.iloc[index, 4:9]).float()
+            params = params.reshape(params.shape[0], 1)
+            params = params.expand(-1, input.shape[1])
+        else: 
+            t = np.linspace(0 + 1.5 * index, 1.5 * (index + 1), self.num_samples)
+            b = self.annotations.iloc[index, 5:9].to_numpy()
+            params = torch.tensor((b[2]*np.abs( np.sin( b[0]/2*t + b[1]/2 ) ) + b[3])/b[2]).float()
+            params = params.reshape(1, params.shape[0])
+
+        if self.subset == "Training":
+            input = input[:, rem * self.tbptt_len:(rem + 1) * self.tbptt_len]
+            target = target[:, rem * self.tbptt_len:(rem + 1) * self.tbptt_len]
+            params = params[:, rem * self.tbptt_len:(rem + 1) * self.tbptt_len]
 
         return input, target, params
 
@@ -255,10 +291,10 @@ if __name__ == '__main__':
 
     WKRS = 0
     DEV = False
-    GPUS = 1
-    EPOCHS = 500
-    DEVICE = "Comp"
-    CONFIG = 4
+    GPUS = 0 if DEV else 1
+    EPOCHS = 100
+    DEVICE = "Vox"
+    CONFIG = None
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
@@ -291,9 +327,12 @@ if __name__ == '__main__':
     sample_rate = train_sample_rate
 
     # Train Model
-    trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
-                                log_every_n_steps=1, fast_dev_run=DEV)
-    model = VA_RNN(sr=sample_rate, n_params=0, device=DEVICE, config=CONFIG)
+    trainer = pl.Trainer(
+        gpus=GPUS, 
+        max_epochs=EPOCHS, 
+        log_every_n_steps=1,
+        fast_dev_run=DEV)
+    model = VA_RNN(sr=sample_rate, n_params=5, device=DEVICE, config=CONFIG)
     #torchsummary.summary(vox_model)
     trainer.fit(model, vox_train_dataloader, vox_val_dataloader)
 
@@ -306,10 +345,3 @@ if __name__ == '__main__':
                                         batch_size=1)
     if not DEV:
         trainer.test(dataloaders=vox_test_dataloader)
-
-############################################################################################
-# TO DO:
-#
-# Allow for modeling individual parameter settings
-# Factor in phase shift as gain increases
-# Improve frequency domain loss fncns

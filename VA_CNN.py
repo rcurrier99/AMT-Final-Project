@@ -6,6 +6,7 @@
 #
 ############################################################################################
 
+from turtle import forward
 import torch
 import torchaudio
 import torchsummary
@@ -43,7 +44,8 @@ class VA_CNN(pl.LightningModule):
                                                                 channels,
                                                                 dilation_growth,
                                                                 kernel_size,
-                                                                layers))
+                                                                layers,
+                                                                self.unit))
         self.blocks.append(nn.Conv1d(channels*layers*blocks, 1, 1, 1, 0))
         
         # Parameter Embedding
@@ -56,7 +58,10 @@ class VA_CNN(pl.LightningModule):
                                     nn.ReLU())
 
     def forward(self, x, p):
-        cond = self.embed(p.float()).type_as(p)
+        if self.unit != "Phase":
+            cond = self.embed(p.float()).type_as(p)
+        else:
+            cond = p.type_as(p)
         #x = x.permute(1, 2, 0)
         z = torch.empty([x.shape[0], self.blocks[-1].in_channels, x.shape[2]]).type_as(x)
         for n, block in enumerate(self.blocks[:-1]):
@@ -136,14 +141,14 @@ class VA_CNN(pl.LightningModule):
         return pred, target
 
 class VA_CNN_Block(nn.Module):
-    def __init__(self, chan_input, chan_output, dilation_growth, kernel_size, layers):
+    def __init__(self, chan_input, chan_output, dilation_growth, kernel_size, layers, device):
         super(VA_CNN_Block, self).__init__()
         self.channels = chan_output
         dilations = [dilation_growth ** lay for lay in range(layers)]
         self.layers = nn.ModuleList()
 
         for dil in dilations:
-            self.layers.append(VA_CNN_Layer(chan_input, chan_output, dil, kernel_size))
+            self.layers.append(VA_CNN_Layer(chan_input, chan_output, dil, kernel_size, device))
             chan_input = chan_output
 
     def forward(self, x, p):
@@ -154,30 +159,44 @@ class VA_CNN_Block(nn.Module):
         return x, z 
 
 class VA_CNN_Layer(nn.Module):
-    def __init__(self, chan_input, chan_output, dilation, kernel_size):
+    def __init__(self, chan_input, chan_output, dilation, kernel_size, device):
         super(VA_CNN_Layer, self).__init__()
         self.channels = chan_output
-        self.conv= nn.Conv1d(in_channels=chan_input,
-                            out_channels=chan_output * 2,
-                            kernel_size=kernel_size,
-                            stride=1,
-                            padding=0,
-                            dilation=dilation)
-        self.mix = nn.Conv1d(in_channels=chan_output,
-                            out_channels=chan_output,
-                            kernel_size=1,
-                            stride=1,
-                            padding=0)
+        self.unit = device
+        self.conv= nn.Conv1d(
+            in_channels=chan_input,
+            out_channels=chan_output * 2,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=0,
+            dilation=dilation)
+        self.mix = nn.Conv1d(
+            in_channels=chan_output,
+            out_channels=chan_output,
+            kernel_size=1,
+            stride=1,
+            padding=0)
         self.lin = nn.Linear(32, chan_output * 2)
+        self.parconv = nn.ConvTranspose1d(
+            in_channels=1,
+            out_channels=chan_output*2, 
+            kernel_size=1,
+            padding=dilation,
+            dilation=dilation)
 
     def forward(self, x, p):
         residual = x
         y = self.conv(x)
-        p = self.lin(p.float())
-        p = p.reshape((p.shape[0], p.shape[1], 1))
-        p = p.expand(-1, -1, y.shape[2])
-        z = torch.tanh(y[:, 0:self.channels, :] + 0*p[:, 0:self.channels, :]) \
-            * torch.sigmoid(y[:, self.channels:, :] + 0*p[:, self.channels:, :])
+        if self.unit != "Phase":
+            p = self.lin(p.float())
+            p = p.reshape((p.shape[0], p.shape[1], 1))
+            p = p.expand(-1, -1, y.shape[2])
+            z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
+                * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
+        else:
+            p = self.parconv(p)
+            z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
+                * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
         z = torch.cat(
             (torch.zeros(residual.shape[0],
                             self.channels,
@@ -185,6 +204,20 @@ class VA_CNN_Layer(nn.Module):
                 z), dim=2)
         x = self.mix(z) + residual
         return x, z
+
+class FiLM(nn.Module):
+    def __init__(self, n_channels, n_params):
+        super(FiLM, self).__init__()
+        self.norm = nn.BatchNorm1d(n_channels, affine=False)
+        self.lin = nn.Linear(n_params, 2*n_channels)
+
+    def forward(self, x, p):
+        p = self.lin(p)
+        g, b = torch.chunk(p, 2, dim=-1)
+
+        x = self.norm(x)
+        x = g*x + b
+
 
 # Error to Signal Ratio Loss
 class ESRLoss(nn.Module):
@@ -260,7 +293,7 @@ class CustomLoss(nn.Module):
 
 class VAMLDataSet(Dataset):
     def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
-
+        self.device = device
         self.input_dir = input_dir
         self.target_dir = target_dir
         df = pd.read_csv(annotations)
@@ -279,7 +312,13 @@ class VAMLDataSet(Dataset):
     def __getitem__(self, index):
         input_path = self._get_input_path(index)
         target_path = self._get_target_path(index)
-        params = torch.tensor(self.annotations.iloc[index, 4:9])
+        if self.device != "Phase":
+            params = torch.tensor(self.annotations.iloc[index, 4:9])
+        else: 
+            t = np.linspace(0 + 1.5 * index, 1.5 * (index + 1), self.num_samples)
+            b = self.annotations.iloc[index, 5:9].to_numpy()
+            params = torch.tensor(b[2]*np.abs( np.sin( b[0]/2*t + b[1]/2 ) ) + b[3]).float()
+            params = params.reshape(1, params.shape[0])
         input, sr1 = torchaudio.load(input_path)
         target, sr2 = torchaudio.load(target_path)
 
@@ -308,10 +347,10 @@ if __name__ == '__main__':
 
     WKRS = 0
     DEV = False
-    GPUS = 1
+    GPUS = 0 if DEV else 1
     EPOCHS = 500
-    DEVICE = "Comp"
-    CONFIG = 4
+    DEVICE = "Phase"
+    CONFIG = 0
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
