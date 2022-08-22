@@ -6,7 +6,6 @@
 #
 ############################################################################################
 
-from turtle import forward
 import torch
 import torchaudio
 import torchsummary
@@ -25,6 +24,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class VA_CNN(pl.LightningModule):
+    ''' 
+    CNN Class for Virtual Analog Modeling
+
+    Built from WaveNet blocks, themselves composed of individual layers
+    employed dilated convolutions
+    '''
     def __init__(self, nparams, sr, device, config, channels=8, blocks=2, 
                 layers=9, dilation_growth=2, kernel_size=3):
         super(VA_CNN, self).__init__()
@@ -40,22 +45,23 @@ class VA_CNN(pl.LightningModule):
         self.kernel_size = kernel_size
         self.blocks = nn.ModuleList()
         for b in range(blocks):
-            self.blocks.append(VA_CNN_Block(1 if b == 0 else channels,
-                                                                channels,
-                                                                dilation_growth,
-                                                                kernel_size,
-                                                                layers,
-                                                                self.unit))
+            self.blocks.append(VA_CNN_Block(
+                1 if b == 0 else channels,
+                channels,
+                dilation_growth,
+                kernel_size,
+                layers,
+                self.unit))
         self.blocks.append(nn.Conv1d(channels*layers*blocks, 1, 1, 1, 0))
         
         # Parameter Embedding
         self.embed = nn.Sequential(
-                                    nn.Linear(self.nparams, 16),
-                                    nn.ReLU(),
-                                    nn.Linear(16, 32),
-                                    nn.ReLU(),
-                                    nn.Linear(32, 32),
-                                    nn.ReLU())
+            nn.Linear(self.nparams, 16),
+            nn.ReLU(),
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU())
 
     def forward(self, x, p):
         if self.unit != "Phase":
@@ -89,7 +95,7 @@ class VA_CNN(pl.LightningModule):
         pred, target = self.pre_emph(pred, target)
         loss = self.loss_fn(pred, target)
         if loss <= self.best_val_loss:
-            self.save_model("VA_CNN.pth")
+            self.save_model(f"VA_CNN_{self.unit}_{self.layers}_{self.channels}_{loss}.pth")     # save best val loss network params
             self.best_val_loss = loss
         self.log("val_loss", loss, sync_dist=True)
 
@@ -106,7 +112,7 @@ class VA_CNN(pl.LightningModule):
         output = self(input, params)
 
         audio = output.reshape((1, output.shape[2])).cpu()
-        file = f"./Data/Output_Files/{self.unit}_CNN_{self.config}_{batch_idx+1}.wav"
+        file = f"./Data/Output_Files/{self.unit}_CNN_{self.config}_{batch_idx+1}.wav"           # save test output files
         torchaudio.save(file, audio, self.sample_rate, bits_per_sample=16)
 
         output, target = self.pre_emph(output, target)
@@ -124,11 +130,13 @@ class VA_CNN(pl.LightningModule):
             'monitor' : 'val_loss'
         }
     
-    def process_samples(self, data_in, data_out, loss_fn):
-        with torch.no_grad():
-            output = self(data_in)
-            loss = loss_fn(output, data_out)
-        return output, loss
+    def process_samples(self, data_in):
+        x = data_in.reshape([1, 1, data_in.shape[1]])
+        p = torch.tensor([2, 5, 0, 0, 0]).float()
+        p = p.reshape([1, p.shape[0]])
+        #p = p.expand(-1, -1, x.shape[2])
+        out = self(x, p)
+        return out.view(1, out.shape[2])
 
     def save_model(self, path):
         torch.save(self.state_dict(), path)
@@ -141,6 +149,11 @@ class VA_CNN(pl.LightningModule):
         return pred, target
 
 class VA_CNN_Block(nn.Module):
+    '''
+    WaveNet Block Class
+
+    Built from layers employing dilated convolutions
+    '''
     def __init__(self, chan_input, chan_output, dilation_growth, kernel_size, layers, device):
         super(VA_CNN_Block, self).__init__()
         self.channels = chan_output
@@ -159,6 +172,9 @@ class VA_CNN_Block(nn.Module):
         return x, z 
 
 class VA_CNN_Layer(nn.Module):
+    '''
+    WaveNet Layer Class Using Dilated Convolutions
+    '''
     def __init__(self, chan_input, chan_output, dilation, kernel_size, device):
         super(VA_CNN_Layer, self).__init__()
         self.channels = chan_output
@@ -183,40 +199,58 @@ class VA_CNN_Layer(nn.Module):
             kernel_size=1,
             padding=dilation,
             dilation=dilation)
+        #self.film = FiLM(32, chan_output, self.unit, dilation)
 
     def forward(self, x, p):
         residual = x
         y = self.conv(x)
+        #z = torch.tanh(y[:, 0:self.channels, :]) * torch.sigmoid(y[:, self.channels:, :])
+        #z = self.film(z, p)
         if self.unit != "Phase":
-            p = self.lin(p.float())
-            p = p.reshape((p.shape[0], p.shape[1], 1))
-            p = p.expand(-1, -1, y.shape[2])
-            z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
+           p = self.lin(p.float())
+           p = p.reshape((p.shape[0], p.shape[1], 1))
+           p = p.expand(-1, -1, y.shape[2])
+           z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
                 * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
+           #z = self.film(z, p)
         else:
             p = self.parconv(p)
             z = torch.tanh(y[:, 0:self.channels, :] + p[:, 0:self.channels, :]) \
                 * torch.sigmoid(y[:, self.channels:, :] + p[:, self.channels:, :])
         z = torch.cat(
-            (torch.zeros(residual.shape[0],
-                            self.channels,
-                            residual.shape[2] - z.shape[2]).type_as(z), 
-                z), dim=2)
+            (torch.zeros(
+                    residual.shape[0],
+                    self.channels,
+                    residual.shape[2] - z.shape[2]).type_as(z), z), dim=2)
         x = self.mix(z) + residual
         return x, z
 
 class FiLM(nn.Module):
-    def __init__(self, n_channels, n_params):
+    ''' Class for CNN FiLM Conditioning '''
+    def __init__(self, n_params, n_channels, unit, dil):
         super(FiLM, self).__init__()
-        self.norm = nn.BatchNorm1d(n_channels, affine=False)
-        self.lin = nn.Linear(n_params, 2*n_channels)
+        self.unit = unit
+        if unit != "Phase":
+            self.lay = nn.Linear(n_params, 2*n_channels)
+        else:
+            self.lay = nn.ConvTranspose1d(1, 2*n_channels, 1, padding=dil, dilation=dil)
 
     def forward(self, x, p):
-        p = self.lin(p)
-        g, b = torch.chunk(p, 2, dim=-1)
+        p = self.lay(p.float())
+        if self.unit != "Phase":
+            g, b = torch.chunk(p, 2, dim=-1)
+            g = g.reshape((g.shape[0], g.shape[1], 1))
+            b = b.reshape((b.shape[0], b.shape[1], 1))
+            g = g.expand(-1, -1, x.shape[2])
+            b = b.expand(-1, -1, x.shape[2])
+        else:
+            g, b = torch.chunk(p, 2, dim=1)
 
-        x = self.norm(x)
-        x = g*x + b
+        s1 = x.shape
+        s2 = g.shape
+        s3 = b.shape
+
+        return g*x + b
 
 
 # Error to Signal Ratio Loss
@@ -292,6 +326,10 @@ class CustomLoss(nn.Module):
         return 0.75 * esrloss + 0.25 * dcloss
 
 class VAMLDataSet(Dataset):
+    ''' 
+    Data Set Class
+    To be used w/ dataloader
+    '''
     def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
         self.device = device
         self.input_dir = input_dir
@@ -345,12 +383,12 @@ class VAMLDataSet(Dataset):
 
 if __name__ == '__main__':
 
-    WKRS = 0
-    DEV = False
+    WKRS = 0                            # Keep at 0 or else danger
+    DEV = False                         # True for debugging on CPU, False for training on GPU
     GPUS = 0 if DEV else 1
-    EPOCHS = 500
-    DEVICE = "Phase"
-    CONFIG = 0
+    EPOCHS = 250                        # Max training epochs
+    DEVICE = "Vox"                      # Device to be modeled ("Vox", "Comp", or "Phase")
+    CONFIG = None                       # Parameter configuration(s) to be trained on (None for all configs)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
@@ -385,7 +423,7 @@ if __name__ == '__main__':
     # Train Model
     trainer = pl.Trainer(gpus=GPUS, max_epochs=EPOCHS, 
                             log_every_n_steps=1, fast_dev_run=DEV)
-    model = VA_CNN(sr=sample_rate, nparams=5, device=DEVICE, config=CONFIG)
+    model = VA_CNN(sr=sample_rate, layers=9, channels=8, nparams=5, device=DEVICE, config=CONFIG)
     #torchsummary.summary(vox_model)
     trainer.fit(model, vox_train_dataloader, vox_val_dataloader)
 
@@ -398,10 +436,3 @@ if __name__ == '__main__':
                                         batch_size=1)
     if not DEV:
         trainer.test(dataloaders=vox_test_dataloader)
-
-############################################################################################
-# TO DO:
-#
-# Allow for modeling individual parameter settings
-# Factor in phase shift as gain increases
-# Improve frequency domain loss fncns

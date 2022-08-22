@@ -60,7 +60,7 @@ add_subdirectory(JUCE)                    # If you've put JUCE in a subdirectory
 # Check the readme at `docs/CMake API.md` in the JUCE repo for the full list.
 
 juce_add_plugin(AudioPluginExample
-    # VERSION ...                               # Set this if the plugin version is different to the project version
+    VERSION 7.0.1                               # Set this if the plugin version is different to the project version
     # ICON_BIG ...                              # ICON_* arguments specify a path to an image file to use as an icon for the Standalone
     # ICON_SMALL ...
     # COMPANY_NAME ...                          # Specify the name of the plugin's author

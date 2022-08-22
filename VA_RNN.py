@@ -23,11 +23,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 class VA_RNN(pl.LightningModule):
+    ''' 
+    RNN Class for Virtual Analog Modeling
+    '''
     def __init__(self, sr, n_params, device, config, 
                     input_size=1, output_size=1, hidden_size=32):
         super(VA_RNN, self).__init__()
         self.sample_rate = sr
         self.input_size = input_size + n_params
+        self.hidden_size = hidden_size
         self.output_size = output_size
         self.unit = device
         self.config = config
@@ -39,20 +43,39 @@ class VA_RNN(pl.LightningModule):
         self.embed = nn.ConvTranspose1d(1, 8, 1)
         self.lim = nn.Hardtanh()
         self.loss_fn = CustomLoss()
-        self.enc = nn.Conv1d(1, 8, 3, padding='same')
-        self.dec = nn.ConvTranspose1d(8, 1, 3, padding=1)
+        #self.enc = nn.Conv1d(1, 8, 3, padding='same')
+        #self.dec = nn.ConvTranspose1d(8, 1, 3, padding=1)
+        #self.cond = nn.ModuleList([
+            #FiLM(n_params, 32),
+            #nn.ConvTranspose1d(32, 16, 3, padding=1),
+            #FiLM(n_params, 16),
+            #nn.ConvTranspose1d(16, 8, 3, padding=1),
+            #FiLM(n_params, 8),
+            #nn.ConvTranspose1d(8, 4, 3, padding=1),
+            #FiLM(n_params, 4),
+            #nn.ConvTranspose1d(4, 2, 3, padding=1),
+            #FiLM(n_params, 2),
+            #nn.ConvTranspose1d(2, 1, 3, padding=1)
+        #])
 
     def forward(self, x, p):
         #x = self.enc(x)
 
         x = x.permute(2, 0, 1)                      # --> (seq, batch, channel)
-        p = p.permute(2, 0, 1)
-        res = x.type_as(x)
+        p = p.permute(2, 0, 1)                      # ...
+        res = x.type_as(x)                          # save residual
 
         x = torch.cat((x, p), dim=-1)               # append on channel dim
         out, _ = self.rec(x)
-        out = self.lim(self.lin(out) + res)
+        #out = out.permute(1, 2, 0)
+        #for i, lay in enumerate(self.cond):
+            #s1 = out.shape
+            #s2 = p.shape
+            #out = lay(out, p) if (i % 2 == 0) else lay(out)
+        #return self.lim(out + res.permute(1, 2, 0))
+        out = self.lim(self.lin(out) + res)         # dont explode
         return out.permute(1, 2, 0)                 # --> (batch, channel, seq)
+
         
         #return self.dec(out)
 
@@ -77,7 +100,7 @@ class VA_RNN(pl.LightningModule):
         pred, target = self.pre_emph(pred, target)
         loss = self.loss_fn(pred, target)
         if loss <= self.best_val_loss:
-            self.save_model("VA_RNN.pth")
+            self.save_model(f"VA_RNN_{self.unit}_{self.hidden_size}_{loss}.pth")        # save best val loss network params
             self.best_val_loss = loss
         self.log("val_loss", loss, sync_dist=True)
 
@@ -94,7 +117,7 @@ class VA_RNN(pl.LightningModule):
         output = self(input, params)
 
         audio = output.reshape((1, output.shape[2])).cpu()
-        file = f"./Data/Output_Files/{self.unit}_RNN_{self.config}_{batch_idx+1}.wav"
+        file = f"./Data/Output_Files/{self.unit}_RNN_{self.config}_{batch_idx+1}.wav"   # save test output files
         torchaudio.save(file, audio, self.sample_rate, bits_per_sample=16)
 
         output, target = self.pre_emph(output, target)
@@ -104,25 +127,22 @@ class VA_RNN(pl.LightningModule):
     @torch.jit.unused
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=0.0005)
-        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                            patience=10, verbose=True)
+        lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            patience=10,
+            verbose=True)
         return {
             'optimizer' : optimizer,
             'lr_scheduler' : lr_scheduler,
             'monitor' : 'val_loss'
         }
 
-    def process_samples(self, in_data, out_data, loss_fn, length):
-        with torch.no_grad():
-            output = torch.empty_like(out_data)
-            for l in range(int(output.size()[0] / length)):
-                output[l*length:(l+1)*length] = self(in_data[l*length:(l+1)*length])
-                self.detach_hidden
-            if not (output.size()[0] / length).is_integer():
-                output[(l+1)*length:-1] = self(in_data[(l+1)*length:-1])
-            self.reset_hidden
-            loss = loss_fn(output, out_data)
-        return output, loss
+    def process_samples(self, in_data):
+        x = in_data.reshape([1, 1, in_data.shape[1]])
+        res = x
+        p = torch.tensor([2, 5, 0, 0, 0]).float()
+        out = self(x, p)
+        return out.view(1, out.shape[2])
                     
     def save_model(self, path):
         torch.save(self.state_dict(), path)
@@ -133,6 +153,25 @@ class VA_RNN(pl.LightningModule):
         pred = filter(pred).type_as(pred)
         target = filter(target).type_as(target)
         return pred, target
+
+class FiLM(nn.Module):
+    ''' RNN FiLM Conditioning Class '''
+    def __init__(self, n_params, n_channels):
+        super(FiLM, self).__init__()
+        self.channels = n_channels
+        self.lay = nn.ConvTranspose1d(n_params, 2*n_channels, 1)
+
+    def forward(self, x, p):
+        p = self.lay(p.float())
+        s4 = p.shape
+        g, b = torch.chunk(p, 2, dim=1)
+        s2 = g.shape
+        s3 = b.shape
+
+
+        s1 = x.shape
+
+        return g*x + b
         
 # Error to Signal Ratio Loss
 class ESRLoss(nn.Module):
@@ -217,6 +256,10 @@ class CustomLoss(nn.Module):
         return 0.75 * esrloss + 0.25 * dcloss # + stftloss)/2
 
 class VAMLDataSet(Dataset):
+    ''' 
+    Data Set Class
+    To be used w/ dataloader
+    '''
     def __init__(self, device, subset, input_dir, target_dir, annotations, config=None):
         self.device = device
         self.input_dir = input_dir
@@ -289,12 +332,12 @@ class VAMLDataSet(Dataset):
 
 if __name__ == '__main__':
 
-    WKRS = 0
-    DEV = False
+    WKRS = 0                            # Keep at 0 or else danger
+    DEV = True                          # True for debugging on CPU, False for training on GPU
     GPUS = 0 if DEV else 1
-    EPOCHS = 100
-    DEVICE = "Vox"
-    CONFIG = None
+    EPOCHS = 500                        # Max training epochs
+    DEVICE = "Vox"                      # Device to be modeled ("Vox", "Comp", or "Phase")
+    CONFIG = None                       # Parameter configuration(s) to be trained on (None for all configs)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
@@ -332,7 +375,7 @@ if __name__ == '__main__':
         max_epochs=EPOCHS, 
         log_every_n_steps=1,
         fast_dev_run=DEV)
-    model = VA_RNN(sr=sample_rate, n_params=5, device=DEVICE, config=CONFIG)
+    model = VA_RNN(sr=sample_rate, hidden_size=32, n_params=5, device=DEVICE, config=CONFIG)
     #torchsummary.summary(vox_model)
     trainer.fit(model, vox_train_dataloader, vox_val_dataloader)
 

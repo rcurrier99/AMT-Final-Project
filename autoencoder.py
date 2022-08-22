@@ -40,17 +40,15 @@ class VA_Transformer(pl.LightningModule):
         super(VA_Transformer, self).__init__()
         self.lr = lr
         self.sample_rate = sr
+        self.encoder_size = 3
+        self.hidden_size = 32
+        self.decoder_size = 3
         self.loss_fn = CustomLoss()
         self.best_val_loss = 1000000
-        self.transformer = nn.Transformer(
-            channels, 
-            num_heads,
-            num_encoder_layers,
-            num_decoder_layers,
-            ff_expansion,
-            dropout=0
-        )
-        self.lin = nn.Linear(pow(ff_expansion, num_encoder_layers), output_size)
+        self.enc = VAEncoder()
+        self.rec = nn.LSTM(self.encoder_size, self.hidden_size)
+        self.lin = nn.Linear(self.hidden_size, self.decoder_size)
+        self.dec = VADecoder()
 
     def forward(self, x, t, p):
         x = x.permute(1, 0, 2)                      # --> (channel, batch, seq)
@@ -112,6 +110,62 @@ class VA_Transformer(pl.LightningModule):
             'lr_scheduler' : lr_scheduler,
             'monitor' : 'val_loss'
         }
+
+class FiLM(nn.Module):
+    def __init__(self, n_params, embed_dim):
+        super(FiLM, self).__init__()
+        self.n_params = n_params
+        self.embed_dim = embed_dim
+        self.norm = nn.BatchNorm1d(self.n_params, affine=False)
+        self.lin = nn.Linear(self.embed_dim, 2*self.n_params)
+
+    def forward(self, x, p):
+        cond = self.lin(p).type_as(p)
+        g, b = torch.chunk(cond, 2, dim=-1).type_as(cond)
+        x = self.norm(x)
+        x = g*x + b
+        return x
+
+class VADecoder(nn.Module):
+    def __init__(self, n_layers, dec_size):
+        super(VADecoder, self).__init__()
+        self.n_layers = n_layers
+        self.dec_size = dec_size
+        self.wavelet = pywt.Wavelet('db4')
+
+    def forward(self, x):
+        for i in range(self.n_layers):
+            x = ptwt.waverec(x, self.wavelet)
+
+class VAEncoder(nn.Module):
+    def __init__(self, n_layers, n_params, enc_size):
+        super(VAEncoder, self).__init__()
+        self.n_layers = n_layers
+        self.n_params = n_params
+        self.enc_size = enc_size
+        self.wavelet = pywt.Wavelet('db4')
+        self.embed = nn.Sequential(
+            nn.Linear(n_params, 16),
+            nn.ReLU(),
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU()
+        )
+        self.FiLM = nn.Sequential()
+        self.ReLU = nn.ReLu()
+        for i in range(n_layers):
+            self.FiLM.append(FiLM(32, 32))
+
+    def forward(self, x, p):
+        cond = self.embed(p)
+        for i in range(self.n_layers):
+            x = ptwt.wavedec(x, self.wavelet, mode='zero', level=1)
+            x = self.FilM(i)(x, cond)
+            x = self.ReLU(x)
+            
+
+
 
 # Error to Signal Ratio Loss
 class ESRLoss(nn.Module):

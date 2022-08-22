@@ -29,24 +29,38 @@ input_dir = "./Data/Input_Files"
 target_dir = "./Data/Target_Files"
 annotations = "./Data/VAML_Annotation.csv"
 
-device = "Comp"          # device
-n = 150                  # file number   
-config = None              # parameter configuration
+device = "Phase"          # device
+n = 10                  # file number   
+config = 2              # parameter configuration
 inv = 0                 # 1 to invert result
 
 test_dataset = VAMLDataSet(device, "Testing", input_dir, target_dir, annotations, config)
+df = pd.read_csv(annotations)
+if config == None:
+    df = df[(df['device'] == device) & (df['subset'] == "Testing")]
+else:
+    df = df[(df['device'] == device) & (df['subset'] == "Testing") & (df['config'] == config)]
+#print(annotations.head())
 
 fac = pow(-1, inv)
 
 RNN_file = "./Data/Output_Files/" + device + "_RNN_" + str(config) + "_" + str(n+1) + ".wav"
-CNN_file = "./Data/Output_Files/" + device + "_RNN_" + str(config) + "_" + str(n+1) + ".wav"
+CNN_file = "./Data/Output_Files/" + device + "_CNN_" + str(config) + "_" + str(n+1) + ".wav"
 
 data, target, params = test_dataset.__getitem__(n)
 
 RNN_res, _ = torchaudio.load(RNN_file)
 CNN_res, _ = torchaudio.load(CNN_file)
 
-gain = params[0].numpy()
+value = params[0].numpy()[0] if device == "Vox" else params[1].numpy()[0] if device == "Comp" else df.iloc[n, 4]
+print(df.shape)
+switch = 0
+positions = ["Bright", "Thick"]
+control = "Gain" if device == "Vox" else "Sensitivity" if device == "Comp" else "Rate"
+if (device == "Vox") & (value % 3 == 0):
+    value -= int(value // 7 + 1)
+    switch = 1
+title = control + "=" + str(value) if device != "Vox" else control + "=" + str(value) + ", " + "Switch=" + positions[switch]
 
 loss_fn = CustomLoss()
 rnn_loss = loss_fn(fac * RNN_res, target).numpy()
@@ -65,18 +79,20 @@ CNN_res_spec = spec(CNN_res)
 ## Plotting
 t = np.linspace(0, 1.5, 66150)
 fig1, axs1 = plt.subplots(2, 1, constrained_layout=True, sharex=True, sharey=True)
-fig1.suptitle("Gain=" + str(gain), fontsize=16)
-axs1[0].plot(t, fac * torch.transpose(RNN_res, 0, 1))
-axs1[0].plot(t, torch.transpose(target, 0, 1), 'k--', lw=1)
+fig1.suptitle(title, fontsize=16)
+axs1[0].plot(t[26000:34000], torch.transpose(target, 0, 1)[26000:34000])
+axs1[0].plot(t[26000:34000], fac * torch.transpose(RNN_res, 0, 1)[26000:34000], 'k--', lw=1)
 axs1[0].set_title("RNN Output" + " Loss=" + str(rnn_loss))
 axs1[0].set_xlabel("Time (s)")
-axs1[1].plot(t, fac * torch.transpose(CNN_res, 0, 1))
-axs1[1].plot(t, torch.transpose(target, 0, 1), 'k--', lw=1)
+axs1[0].legend(['Target', 'Predicted'])
+axs1[1].plot(t[26000:34000], torch.transpose(target, 0, 1)[26000:34000])
+axs1[1].plot(t[26000:34000], fac * torch.transpose(CNN_res, 0, 1)[26000:34000], 'k--', lw=1)
 axs1[1].set_title("CNN Output" + " Loss=" + str(cnn_loss))
 axs1[1].set_xlabel("Time (s)")
+axs1[1].legend(['Target', 'Predicted'])
 
 fig2, axs2 = plt.subplots(3, 1, constrained_layout=True, sharex=True, sharey=True)
-fig2.suptitle("Gain=" + str(gain), fontsize=16)
+fig2.suptitle(title, fontsize=16)
 im1 = librosa.display.specshow(tar_spec, x_axis='time', y_axis='log', ax=axs2[0])
 fig2.colorbar(im1, ax=axs2[0], format="%+2.f dB")
 axs2[0].set(title='Target')
